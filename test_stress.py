@@ -54,7 +54,7 @@ def _require_health(base: str) -> dict:
         sys.exit(2)
     if "data" not in body:
         print(f"health 响应无 data 字段 (http={r.status_code}): {body}", flush=True)
-        print("常见原因: 1) datadome-service 未启动  2) PORT 不对  3) 该端口上是别的程序", flush=True)
+        print("常见原因: 1) app.py 未启动  2) PORT 不对  3) 该端口上是别的程序", flush=True)
         sys.exit(2)
     if body.get("code") != 0:
         print(f"health 失败: {body}", flush=True)

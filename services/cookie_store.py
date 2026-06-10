@@ -1,4 +1,4 @@
-"""Redis cookie 读写（与 datadome-g2 共用 key 格式）。"""
+"""Redis cookie 读写。"""
 from __future__ import annotations
 
 import json

@@ -1,43 +1,61 @@
 # datadome-g2
 
-**单机版**：在生产服务器上同时跑 Flask API + Firefox 浏览器池（旧架构）。
-
-与 `datadome-service`（中转 API + 生产 worker 分离）并存，适合一台机器搞定全部的场景。
+G2 DataDome cookie 服务（单机部署）：Flask API + Firefox 浏览器池同机运行。
 
 ## 架构
 
 ```
-下游 POST /cookie/acquire  →  BrowserPool(N)  →  Firefox  →  cookie → Redis
-         （本机 Flask app.py，无 Redis 任务队列）
+Client  --POST /cookie/acquire-->  Flask (app.py)
+                                      |
+                                      v
+                               BrowserPool + Firefox
+                                      |
+                                      v
+                                    Redis
 ```
 
-## 启动
-
-```powershell
-.\.venv\Scripts\python.exe app.py
-# 生产: waitress-serve --listen=0.0.0.0:51051 --threads=8 app:app
-```
-
-`app.py` 启动时会初始化 BrowserPool；Firefox 仅在收到 `POST /cookie/acquire` 时打开。
-
-## 下游
-
-```bash
-curl -X POST "http://<本机IP>:51051/api/datadome/v1/cookie/acquire?key=xxx"
-```
-
-或读 Redis：`datadome:g2:ck` / `datadome:g2:ck:pool`
-
-## 安装
+## 快速开始
 
 ```powershell
 uv venv --python 3.12 .venv
 uv pip install -r requirements.txt --python .venv\Scripts\python.exe
 .\.venv\Scripts\python.exe -m ruyipage install
 copy .env.example .env
+# 编辑 .env：FIREFOX_PATH、RDS_*、API_KEY 等
+
+.\.venv\Scripts\python.exe app.py
 ```
 
-## 自测
+生产环境建议：
+
+```powershell
+waitress-serve --listen=0.0.0.0:51051 --threads=8 app:app
+```
+
+## API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | 健康检查 |
+| GET | `/api/datadome/v1/config` | 配置（需 API Key） |
+| POST | `/api/datadome/v1/cookie/acquire` | 取 cookie（阻塞） |
+| GET | `/api/datadome/v1/cookie` | 最近一次 cookie（调试） |
+
+```bash
+curl -X POST "http://127.0.0.1:51051/api/datadome/v1/cookie/acquire?key=YOUR_KEY"
+```
+
+## 配置说明
+
+复制 `.env.example` 为 `.env` 后填写：
+
+- `FIREFOX_PATH`：ruyipage 安装的 Firefox 路径
+- `PROXY_URL`：可选，`http://user:pass@host:port`
+- `RDS_*` / `REDIS_KEY`：Redis 连接与 key 前缀
+
+**勿将 `.env` 提交到 Git。**
+
+## 测试
 
 ```powershell
 .\.venv\Scripts\python.exe test_api.py
@@ -45,20 +63,12 @@ copy .env.example .env
 .\.venv\Scripts\python.exe test_pool_validity.py
 ```
 
-## 与 datadome-service 的区别
-
-| | datadome-g2（本目录） | datadome-service |
-|---|---|---|
-| 部署 | 单机 Flask + 浏览器 | 中转 `app.py` + 生产 `worker.py` |
-| 入口 | `app.py` | 中转 `app.py` / 生产 `worker.py` |
-| Redis 队列 | 无 | 有（`:queue` / `:task:{id}`） |
-
 ## 目录
 
 ```
-app.py                 Flask + BrowserPool 入口
-api/routes.py          HTTP 路由
-services/browser.py    Firefox 取 cookie
+app.py
+api/routes.py
+services/browser.py
 services/browser_pool.py
 services/cookie_store.py
 config.py

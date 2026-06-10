@@ -1,4 +1,4 @@
-"""datadome-service API 测试。"""
+"""datadome-g2 API 测试。"""
 from __future__ import annotations
 
 import argparse
