@@ -1,0 +1,36 @@
+# 密钥 / 本地配置（勿提交）
+.env
+.env.local
+.env.*.local
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Firefox 浏览器 profile（运行时生成，体积大）
+profiles/*
+!profiles/.gitkeep
+
+# 测试产物
+test_*_results.json
+
+# 日志
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
