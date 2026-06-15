@@ -376,17 +376,31 @@ def _slider_drag_target(handle):
         """
         function () {
             const el = this;
-            const track =
+            let track =
                 el.closest('.captcha__slider, .sliderContainer, #captcha__slider') ||
                 el.parentElement;
             if (!track) return null;
             const hr = el.getBoundingClientRect();
-            const tr = track.getBoundingClientRect();
+            let tr = track.getBoundingClientRect();
+            for (let node = track; node; node = node.parentElement) {
+                const nr = node.getBoundingClientRect();
+                if (nr.width >= Math.max(hr.width * 4, 160)) {
+                    track = node;
+                    tr = nr;
+                    break;
+                }
+            }
             if (hr.width < 2 || tr.width < 10) return null;
-            const pad = 6 + Math.random() * 5;
+            const rightPad = 1 + Math.random() * 2;
+            const viewportRight = (window.innerWidth || document.documentElement.clientWidth || tr.right) - 2;
+            const targetX = Math.min(tr.right - rightPad, viewportRight);
             return {
-                x: Math.round(tr.x + tr.width - hr.width / 2 - pad),
+                x: Math.round(targetX),
                 y: Math.round(hr.y + hr.height / 2 + (Math.random() - 0.5) * 2),
+                track_left: Math.round(tr.left),
+                track_right: Math.round(tr.right),
+                track_width: Math.round(tr.width),
+                handle_width: Math.round(hr.width),
             };
         }
         """
@@ -411,7 +425,15 @@ def _try_solve_datadome_slider(page) -> bool:
     duration = random.uniform(1.0, 1.6)
     handle.drag_to(target, duration=duration)
     time.sleep(random.uniform(1.0, 1.5))
-    logger.info("slider drag done duration=%.2fs target_x=%s", duration, target.get("x"))
+    logger.info(
+        "slider drag done duration=%.2fs target_x=%s track=%s-%s width=%s handle=%s",
+        duration,
+        target.get("x"),
+        target.get("track_left"),
+        target.get("track_right"),
+        target.get("track_width"),
+        target.get("handle_width"),
+    )
     return True
 
 
