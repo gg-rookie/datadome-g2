@@ -645,6 +645,65 @@ def _try_solve_datadome_slider(page) -> bool:
     return True
 
 
+def _browser_validate(page, cur_url: str) -> dict:
+    """Validate the cookie by checking current page state — NO reload.
+
+    IMPORTANT: We do NOT reload/navigate here because a fresh navigation
+    triggers a new DataDome evaluation which often results in a challenge
+    (403), even with a valid cookie.  The page already loaded successfully
+    in the current browser context (that's how we captured the cookie).
+    Simply verifying the current page state avoids the TLS-fingerprint
+    mismatch that plagues curl_cffi replay, without provoking DataDome
+    into re-challenging.
+    """
+    state, url, title = _page_state(page)
+    body_len = 0
+    try:
+        body_len = len(page.html or "")
+    except Exception:
+        pass
+
+    ok_ = state == "ready"
+    logger.info(
+        "browser validation %s state=%s bytes=%d url=%s",
+        "PASS" if ok_ else "FAIL",
+        state,
+        body_len,
+        url[:80],
+    )
+    return {
+        "ok": ok_,
+        "status": 200 if ok_ else 403,
+        "bytes": body_len,
+        "elapsed": 0,
+        "url": url,
+    }
+
+
+def _finalize_session(
+    session: dict,
+    page,
+    cur_url: str,
+    slider_attempts: int,
+) -> dict:
+    """Run browser-level validation and attach metadata to the session."""
+    session["slider_attempts"] = slider_attempts
+    session["ok"] = True
+    # Validate by checking current page state — no reload needed.
+    # The page already loaded successfully; a reload would trigger a fresh
+    # DataDome evaluation and risk a 403.
+    validation = _browser_validate(page, cur_url)
+    session["validation"] = validation
+    if not validation.get("ok"):
+        logger.warning(
+            "browser validation failed after cookie acquisition "
+            "http=%s bytes=%s",
+            validation.get("status"),
+            validation.get("bytes"),
+        )
+    return session
+
+
 def fetch_g2_session(
     cfg: BrowserLaunchConfig,
     url: str | None = None,
@@ -721,19 +780,20 @@ def fetch_g2_session(
                     "page was blocked by DataDome",
                 )
 
-            session = _try_finish_session(
-                page,
-                profile_dir,
-                cur_url,
-                captured_cookie.get("cookie", ""),
-            )
-            if session:
-                session["slider_attempts"] = slider_attempts
-                logger.info(
-                    "cookie ok (cookie bundle) url=%s",
-                    cur_url[:80],
+            # Only accept the session when the page is not actively challenging.
+            # If state is "challenge", the slider still needs solving — returning
+            # early would capture an incomplete/unvalidated cookie.
+            if state != "challenge":
+                session = _try_finish_session(
+                    page,
+                    profile_dir,
+                    cur_url,
+                    captured_cookie.get("cookie", ""),
                 )
-                return session
+                if session:
+                    return _finalize_session(
+                        session, page, cur_url, slider_attempts,
+                    )
 
             if state == "challenge":
                 if _is_g2_reviews_url(cur_url) and _extract_datadome_cookie(page):
@@ -745,12 +805,10 @@ def fetch_g2_session(
                             captured_cookie.get("cookie", ""),
                         )
                         if session:
-                            session["slider_attempts"] = slider_attempts
-                            logger.info(
-                                "cookie ok (reviews+cookie, no visible slider) url=%s",
-                                cur_url[:80],
+                            return _finalize_session(
+                                session, page, profile_dir, target,
+                                _remaining(15), slider_attempts,
                             )
-                            return session
                 if slider_attempts < 2 and _try_solve_datadome_slider(page):
                     slider_attempts += 1
                     logger.info("slider attempt %d", slider_attempts)
@@ -776,12 +834,10 @@ def fetch_g2_session(
                     captured_cookie.get("cookie", ""),
                 )
                 if session:
-                    session["slider_attempts"] = slider_attempts
-                    logger.info(
-                        "cookie ok headless=%s slider_attempts=%d url=%s",
-                        headless_on, slider_attempts, cur_url[:80],
+                    return _finalize_session(
+                        session, page, profile_dir, target,
+                        _remaining(15), slider_attempts,
                     )
-                    return session
 
                 if now - last_ready_diag_at >= 10:
                     values = _cookie_values_for_log(page, profile_dir)

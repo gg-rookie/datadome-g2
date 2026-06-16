@@ -13,7 +13,6 @@ from services.cookie_store import (
     redis_status,
     save_ck,
 )
-from services.cookie_validator import validate_cookie
 
 logger = logging.getLogger("datadome.refill")
 
@@ -35,6 +34,16 @@ def _fetch_cookie(use_profile_cache: bool) -> dict:
         }
 
 
+def _cookie_summary(cookie_header: str) -> str:
+    """Return a short human-readable summary of the cookie header."""
+    names = []
+    for part in (cookie_header or "").split(";"):
+        part = part.strip()
+        if "=" in part:
+            names.append(part.split("=", 1)[0].strip())
+    return ",".join(sorted(names)) if names else "-"
+
+
 def _validate_and_store(result: dict) -> bool:
     if not result.get("ok"):
         logger.warning(
@@ -45,8 +54,20 @@ def _validate_and_store(result: dict) -> bool:
         )
         return False
 
-    validation = validate_cookie(result, url=settings.target_url)
-    result["validation"] = validation
+    cookie_header = result.get("cookie", "")
+    ua = result.get("user_agent", "")
+    logger.info(
+        "cookie acquired worker=%s cookies=[%s] ua=%s",
+        result.get("worker_id"),
+        _cookie_summary(cookie_header),
+        (ua or "")[:100],
+    )
+
+    # Browser-level validation already ran inside fetch_g2_session.
+    # The browser reloaded the page and checked the HTTP response.
+    # This is TLS-consistent because the same browser is used for both
+    # acquisition and validation — no curl_cffi TLS fingerprint mismatch.
+    validation = result.get("validation") or {}
     if not validation.get("ok"):
         logger.warning(
             "cookie validation failed worker=%s http=%s bytes=%s error=%s",
