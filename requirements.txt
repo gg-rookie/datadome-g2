@@ -1,3 +1,4 @@
 redis>=5.0.0
 ruyipage>=1.2.0
 curl_cffi>=0.15.0
+requests>=2.31.0
