@@ -1,4 +1,4 @@
-"""环境变量配置。"""
+"""Environment variable configuration."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -39,11 +39,6 @@ def _resolve_path(path: str | Path) -> Path:
 
 @dataclass(frozen=True)
 class Settings:
-    host: str = _env.get("HOST", "0.0.0.0")
-    port: int = int(_env.get("PORT", "51051"))
-    debug: bool = _bool(_env.get("DEBUG", ""), default=False)
-    api_key: str = _env.get("API_KEY", "")
-
     target_url: str = _env.get(
         "TARGET_URL", "https://www.g2.com/products/slack/reviews"
     )
@@ -56,6 +51,10 @@ class Settings:
         _env.get("BROWSER_POOL_SIZE") or _env.get("BATCH_WORKERS_DEFAULT", "5")
     )
     batch_base_port: int = int(_env.get("BATCH_BASE_PORT", "9222"))
+    target_pool_size: int = int(_env.get("TARGET_POOL_SIZE", "10"))
+    redis_poll_interval: float = float(_env.get("REDIS_POLL_INTERVAL", "10"))
+    refill_success_interval: float = float(_env.get("REFILL_SUCCESS_INTERVAL", "1"))
+    refill_failure_interval: float = float(_env.get("REFILL_FAILURE_INTERVAL", "15"))
 
     rds_host: str = _env.get("RDS_HOST", "127.0.0.1")
     rds_port: int = int(_env.get("RDS_PORT", "6379"))

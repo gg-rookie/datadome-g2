@@ -1,4 +1,4 @@
-"""Redis cookie 读写。"""
+"""Redis cookie storage helpers."""
 from __future__ import annotations
 
 import json
@@ -27,7 +27,7 @@ def redis_client() -> redis.Redis:
 
 
 def redis_status() -> dict:
-    """供 /health 使用：Redis 不可达时不抛异常。"""
+    """Return Redis availability without raising on connection failure."""
     try:
         client = redis_client()
         client.ping()
@@ -69,6 +69,23 @@ def append_ck_to_pool(payload: dict) -> str:
     return key
 
 
+def load_pool() -> list[dict]:
+    rows = redis_client().lrange(pool_key(), 0, -1)
+    items: list[dict] = []
+    for row in rows:
+        try:
+            items.append(json.loads(row))
+        except Exception:
+            continue
+    return items
+
+
+def pool_has_cookie(cookie: str) -> bool:
+    if not cookie:
+        return False
+    return any(item.get("cookie") == cookie for item in load_pool())
+
+
 def load_ck() -> dict | None:
     raw = redis_client().get(settings.redis_key)
     if not raw:
@@ -81,7 +98,3 @@ def pool_size() -> int:
         return int(redis_client().llen(pool_key()) or 0)
     except Exception:
         return 0
-
-
-def redis_ping() -> bool:
-    return redis_status()["ok"]

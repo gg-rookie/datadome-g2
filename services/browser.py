@@ -1,22 +1,24 @@
-"""ruyiPage + Firefox 访问 G2，提取 datadome cookie。"""
+"""Acquire G2 DataDome cookies with ruyiPage + Firefox."""
 from __future__ import annotations
 
 import logging
 import random
 import re
+import shutil
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from ruyipage import FirefoxOptions, FirefoxPage
+from ruyipage import FirefoxOptions, FirefoxPage, apply_smart_fingerprint
+from ruyipage._bidi import session as bidi_session
 from ruyipage._functions.settings import Settings
 
 G2_REVIEWS_RE = re.compile(r"g2\.com/products/.+/reviews", re.I)
 
 logger = logging.getLogger("datadome.browser")
 
-# 5 并行时 BiDi 命令易排队
 _DEFAULT_BIDI_TIMEOUT = 90
 _POLL_INTERVAL_SEC = 1.0
 
@@ -34,6 +36,8 @@ _CAPTCHA_IFRAME_SELECTORS = (
     "css:iframe[src*='captcha-delivery']",
     "css:#captcha__frame",
 )
+
+_G2_COOKIE_NAMES = ("__cf_bm", "cf_clearance", "datadome")
 
 
 @dataclass
@@ -55,7 +59,7 @@ class G2PageError(RuntimeError):
 
 
 def _configure_ruyipage_timeouts(bidi_timeout: int) -> None:
-    """子进程内调高 BiDi 超时，避免多 Firefox 并行时单条命令 30s 误杀。"""
+    """Raise BiDi timeouts inside browser worker processes."""
     bidi_timeout = max(30, bidi_timeout)
     Settings.bidi_timeout = bidi_timeout
     Settings.script_timeout = bidi_timeout
@@ -97,7 +101,7 @@ def _ele_visible(page, selector: str, timeout: float = 0.15) -> bool:
 
 
 def _soft_blocked_light(page) -> bool:
-    """仅可见的验证码 iframe/容器才算 challenge（避免 G2 页残留隐藏节点误判）。"""
+    """Treat only visible DataDome containers as a challenge."""
     for sel in _CAPTCHA_IFRAME_SELECTORS:
         if _ele_visible(page, sel):
             return True
@@ -120,8 +124,20 @@ def _soft_blocked(page) -> bool:
     return False
 
 
+def _hard_blocked_text_light(page) -> bool:
+    for sel in (
+        "text:Please enable JS and disable any ad blocker",
+        "text:Pardon Our Interruption",
+        "text:You have been blocked",
+        "text:Access denied",
+    ):
+        if page.ele(sel, timeout=0.15):
+            return True
+    return False
+
+
 def _extract_datadome_cookie(page) -> str:
-    """BiDi storage.getCookies；不走 document.cookie（datadome 为 HttpOnly）。"""
+    """Read the HttpOnly datadome cookie through BiDi storage."""
     from ruyipage._bidi import storage as bidi_storage
 
     driver = page._driver._browser_driver
@@ -150,10 +166,165 @@ def _extract_datadome_cookie(page) -> str:
     return ""
 
 
-def _try_finish_session(page, cur_url: str = "") -> dict[str, str] | None:
-    """G2 reviews 页已就绪且读到 datadome cookie 时返回。"""
-    datadome_value = _extract_datadome_cookie(page)
-    if not datadome_value:
+def _string_value(raw) -> str:
+    if isinstance(raw, dict):
+        return str(raw.get("value") or "")
+    return str(raw or "")
+
+
+def _header_value(headers, name: str) -> str:
+    name_l = name.lower()
+    for item in headers or []:
+        if str(item.get("name") or "").lower() == name_l:
+            return _string_value(item.get("value"))
+    return ""
+
+
+def _cookie_header_complete(cookie_header: str) -> bool:
+    return all(f"{name}=" in (cookie_header or "") for name in ("cf_clearance", "datadome"))
+
+
+def _install_cookie_header_capture(page) -> dict[str, str]:
+    captured = {"cookie": "", "url": ""}
+    driver = page._driver._browser_driver
+    context_id = page._context_id
+
+    def _on_request(params: dict) -> None:
+        request = params.get("request") or {}
+        url = str(request.get("url") or "")
+        if "g2.com/products/" not in url and "www.g2.com" not in url:
+            return
+        cookie_header = _header_value(request.get("headers"), "cookie")
+        if _cookie_header_complete(cookie_header):
+            captured["cookie"] = cookie_header
+            captured["url"] = url
+
+    try:
+        bidi_session.subscribe(
+            driver,
+            ["network.beforeRequestSent"],
+            contexts=[context_id],
+        )
+        page._driver.set_global_callback(
+            "network.beforeRequestSent",
+            _on_request,
+            immediate=True,
+        )
+    except Exception as e:
+        logger.debug("cookie header capture unavailable: %s", e)
+    return captured
+
+
+def _extract_cookie_values_bidi(page, names: tuple[str, ...]) -> dict[str, str]:
+    from ruyipage._bidi import storage as bidi_storage
+
+    driver = page._driver._browser_driver
+    ctx_id = page._context_id
+    values: dict[str, str] = {}
+
+    def _pick_value(raw: dict) -> str:
+        val = raw.get("value")
+        if isinstance(val, dict):
+            val = val.get("value", "")
+        return str(val or "")
+
+    for partition in ({"context": ctx_id}, None):
+        for name in names:
+            if name in values:
+                continue
+            try:
+                result = bidi_storage.get_cookies(
+                    driver,
+                    filter_={"name": name},
+                    partition=partition,
+                )
+            except Exception:
+                continue
+            for item in result.get("cookies", []):
+                val = _pick_value(item)
+                if val:
+                    values[name] = val
+                    break
+    return values
+
+
+def _extract_cookie_values_sqlite(profile_dir: Path, names: tuple[str, ...]) -> dict[str, str]:
+    db = profile_dir / "cookies.sqlite"
+    if not db.exists():
+        return {}
+    placeholders = ",".join("?" for _ in names)
+    query = (
+        "select name,value from moz_cookies "
+        f"where name in ({placeholders}) and host like ? "
+        "order by lastAccessed desc"
+    )
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+        rows = con.execute(query, (*names, "%g2.com%")).fetchall()
+        con.close()
+    except Exception:
+        return {}
+    values: dict[str, str] = {}
+    for name, value in rows:
+        if name not in values and value:
+            values[str(name)] = str(value)
+    return values
+
+
+def _build_g2_cookie_header(page, profile_dir: Path) -> str:
+    values = _extract_cookie_values_bidi(page, _G2_COOKIE_NAMES)
+    if "datadome" not in values or "cf_clearance" not in values:
+        values = _extract_cookie_values_sqlite(profile_dir, _G2_COOKIE_NAMES)
+    if "datadome" not in values or "cf_clearance" not in values:
+        return ""
+    return "; ".join(
+        f"{name}={values[name]}"
+        for name in _G2_COOKIE_NAMES
+        if values.get(name)
+    )
+
+
+def _profile_user_agent(profile_dir: Path) -> str:
+    prefs = profile_dir / "prefs.js"
+    if not prefs.exists():
+        return ""
+    try:
+        text = prefs.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    m = re.search(r'general\.useragent\.override", "([^"]+)', text)
+    return m.group(1) if m else ""
+
+
+def _profile_cookie_session(profile_dir: Path, cur_url: str = "") -> dict[str, str] | None:
+    values = _extract_cookie_values_sqlite(profile_dir, _G2_COOKIE_NAMES)
+    if not values.get("datadome") or not values.get("cf_clearance"):
+        return None
+    cookie_header = "; ".join(
+        f"{name}={values[name]}"
+        for name in _G2_COOKIE_NAMES
+        if values.get(name)
+    )
+    return {
+        "cookie": cookie_header,
+        "user_agent": _profile_user_agent(profile_dir),
+        "url": cur_url,
+    }
+
+
+def _try_finish_session(
+    page,
+    profile_dir: Path,
+    cur_url: str = "",
+    browser_cookie_header: str = "",
+) -> dict[str, str] | None:
+    """Return the session once G2 has a complete cookie header."""
+    cookie_header = (
+        browser_cookie_header
+        if _cookie_header_complete(browser_cookie_header)
+        else _build_g2_cookie_header(page, profile_dir)
+    )
+    if not cookie_header:
         return None
     try:
         user_agent = page.user_agent or ""
@@ -162,14 +333,14 @@ def _try_finish_session(page, cur_url: str = "") -> dict[str, str] | None:
     if not cur_url:
         cur_url = _page_url_bidi(page)
     return {
-        "cookie": f"datadome={datadome_value}",
+        "cookie": cookie_header,
         "user_agent": user_agent,
         "url": cur_url,
     }
 
 
 def _page_url_bidi(page) -> str:
-    """用 browsingContext.getTree 取 URL，避免 page.url 走 script.evaluate 卡死。"""
+    """Read the current URL through BiDi instead of page.url."""
     try:
         result = page._driver._browser_driver.run(
             "browsingContext.getTree",
@@ -184,7 +355,7 @@ def _page_url_bidi(page) -> str:
 
 
 def _has_visible_slider(page) -> bool:
-    """仅 DataDome 可见 captcha iframe/容器内存在滑块手柄才算有滑块。"""
+    """Return true only when a visible DataDome slider handle exists."""
     for locator in _CAPTCHA_IFRAME_SELECTORS:
         if not _ele_visible(page, locator):
             continue
@@ -205,18 +376,18 @@ def _page_state(page) -> tuple[str, str, str]:
     if _hard_blocked_url(url_l):
         return "blocked", cur_url, ""
 
+    cur_title = page.title or ""
+    title_l = cur_title.lower()
+    if _hard_blocked_title(title_l) or _hard_blocked_text_light(page):
+        return "blocked", cur_url, cur_title
+
     if _is_g2_reviews_url(cur_url):
         if not _soft_blocked_light(page):
             return "ready", cur_url, ""
-        # reviews 已有 cookie 且页面上没有可见滑块 → 视为通过（非用户可见 challenge）
+
         if _extract_datadome_cookie(page) and not _has_visible_slider(page):
             return "ready", cur_url, ""
         return "challenge", cur_url, ""
-
-    cur_title = page.title or ""
-    title_l = cur_title.lower()
-    if _hard_blocked_title(title_l):
-        return "blocked", cur_url, cur_title
 
     if _soft_blocked(page):
         return "challenge", cur_url, cur_title
@@ -239,7 +410,7 @@ def _fpfile_proxy_ready(
 
 
 def _clear_fpfile_proxy(fpfile: Path) -> None:
-    """PROXY_URL 清空时去掉 profile 里残留的 fpfile 代理认证（否则会一直弹框）。"""
+    """Remove stale fpfile proxy credentials when PROXY_URL is empty."""
     if not fpfile.exists():
         return
     skip_prefixes = (
@@ -312,7 +483,7 @@ def _apply_proxy(
 
     parsed = urlparse(proxy_url)
     if not parsed.hostname:
-        raise G2PageError("proxy_invalid", "", "", f"PROXY_URL 无效: {proxy_url}")
+        raise G2PageError("proxy_invalid", "", "", f"invalid PROXY_URL: {proxy_url}")
 
     port = parsed.port or 1000
     username = unquote(parsed.username or "")
@@ -326,6 +497,24 @@ def _apply_proxy(
     if username and password:
         _ensure_fpfile_proxy(fpfile, host, port, username, password)
         opts.set_fpfile(_fpfile_arg(fpfile))
+
+
+def _apply_fingerprint(opts: FirefoxOptions, profile_dir: Path):
+    try:
+        ctx = apply_smart_fingerprint(
+            opts,
+            userdir=str(profile_dir),
+            require_country=None,
+            fetch_ipv6=False,
+            set_proxy_on_opts=False,
+            logger=logger.info,
+        )
+        opts.set_pref("general.useragent.override", ctx.fingerprint.useragent)
+        logger.info("fingerprint ready %s", ctx.summary())
+        return ctx
+    except Exception as e:
+        logger.warning("fingerprint setup skipped: %s", e)
+        return None
 
 
 def proxy_url_for_worker(proxy_url: str, worker_id: int) -> str:
@@ -371,7 +560,7 @@ def _find_slider_handle(root):
 
 
 def _slider_drag_target(handle):
-    """计算滑块拖到轨道右端的视口坐标。"""
+    """Calculate a coordinate near the right edge of the slider track."""
     return handle.run_js(
         """
         function () {
@@ -446,9 +635,17 @@ def fetch_g2_session(
     proxy_url: str | None = None,
     port: int | None = None,
     headless: bool | None = None,
+    use_profile_cache: bool = True,
 ) -> dict[str, str]:
     profile_dir = (user_dir or cfg.profiles_root / "default").resolve()
+    if not use_profile_cache and profile_dir.exists():
+        shutil.rmtree(profile_dir, ignore_errors=True)
     profile_dir.mkdir(parents=True, exist_ok=True)
+    cached_session = _profile_cookie_session(profile_dir, url or cfg.target_url)
+    if use_profile_cache and cached_session:
+        cached_session["slider_attempts"] = 0
+        logger.info("cookie ok (profile cache) url=%s", cached_session["url"][:80])
+        return cached_session
     effective_proxy = proxy_url if proxy_url is not None else cfg.proxy_url
     wait_timeout = timeout or cfg.cookie_timeout
     session_deadline = time.time() + wait_timeout
@@ -467,10 +664,15 @@ def fetch_g2_session(
     if port is not None:
         opts.set_port(port)
     opts.set_timeouts(base=10, page_load=bidi_timeout, script=bidi_timeout)
+    fp_ctx = _apply_fingerprint(opts, profile_dir)
     _apply_proxy(opts, user_dir=profile_dir, proxy_url=effective_proxy)
     opts.set_user_dir(str(profile_dir))
 
     page = FirefoxPage(opts)
+    page_closed = False
+    if fp_ctx:
+        fp_ctx.apply_emulation(page, logger=logger.info)
+    captured_cookie = _install_cookie_header_capture(page)
     target = url or cfg.target_url
     headless_on = cfg.headless if headless is None else headless
     logger.info("fetch start url=%s headless=%s timeout=%s", target, headless_on, wait_timeout)
@@ -482,7 +684,7 @@ def fetch_g2_session(
                 "proxy_auth",
                 page.url or "",
                 page.title or "",
-                "代理认证失败：请使用指纹 Firefox(foxprint) 或检查 PROXY_URL",
+                "proxy authentication failed; check PROXY_URL",
             )
 
         page.wait.doc_loaded(timeout=_remaining(10))
@@ -494,13 +696,32 @@ def fetch_g2_session(
             if state == "blocked":
                 raise G2PageError(
                     "blocked", cur_url, cur_title,
-                    "页面被 DataDome 风控拦截",
+                    "page was blocked by DataDome",
                 )
+
+            session = _try_finish_session(
+                page,
+                profile_dir,
+                cur_url,
+                captured_cookie.get("cookie", ""),
+            )
+            if session:
+                session["slider_attempts"] = slider_attempts
+                logger.info(
+                    "cookie ok (cookie bundle) url=%s",
+                    cur_url[:80],
+                )
+                return session
 
             if state == "challenge":
                 if _is_g2_reviews_url(cur_url) and _extract_datadome_cookie(page):
                     if not _has_visible_slider(page):
-                        session = _try_finish_session(page, cur_url)
+                        session = _try_finish_session(
+                            page,
+                            profile_dir,
+                            cur_url,
+                            captured_cookie.get("cookie", ""),
+                        )
                         if session:
                             session["slider_attempts"] = slider_attempts
                             logger.info(
@@ -519,12 +740,16 @@ def fetch_g2_session(
                     continue
                 raise G2PageError(
                     "blocked", cur_url, cur_title,
-                    "滑块验证未通过",
+                    "slider challenge was not solved",
                 )
 
-            # 必须等 G2 reviews 页加载完且无验证码 iframe，再取 cookie
             if state == "ready":
-                session = _try_finish_session(page, cur_url)
+                session = _try_finish_session(
+                    page,
+                    profile_dir,
+                    cur_url,
+                    captured_cookie.get("cookie", ""),
+                )
                 if session:
                     session["slider_attempts"] = slider_attempts
                     logger.info(
@@ -535,9 +760,46 @@ def fetch_g2_session(
 
             time.sleep(_POLL_INTERVAL_SEC)
 
+        try:
+            cur_url = _page_url_bidi(page)
+            user_agent = page.user_agent or ""
+        except Exception:
+            cur_url = ""
+            user_agent = ""
+        try:
+            page.quit()
+            page_closed = True
+            time.sleep(0.5)
+        except Exception:
+            pass
+        if _cookie_header_complete(captured_cookie.get("cookie", "")):
+            logger.info("cookie ok (timeout network header) url=%s", cur_url[:80])
+            return {
+                "cookie": captured_cookie["cookie"],
+                "user_agent": user_agent,
+                "url": captured_cookie.get("url") or cur_url,
+                "slider_attempts": slider_attempts,
+            }
+
+        values = _extract_cookie_values_sqlite(profile_dir, _G2_COOKIE_NAMES)
+        if values.get("datadome") and values.get("cf_clearance"):
+            cookie_header = "; ".join(
+                f"{name}={values[name]}"
+                for name in _G2_COOKIE_NAMES
+                if values.get(name)
+            )
+            logger.info("cookie ok (timeout sqlite salvage) url=%s", cur_url[:80])
+            return {
+                "cookie": cookie_header,
+                "user_agent": user_agent,
+                "url": cur_url,
+                "slider_attempts": slider_attempts,
+            }
+
         raise G2PageError(
             "timeout", "", "",
-            f"等待 G2 页面加载完成并获取 datadome cookie 超时（{wait_timeout}s）",
+            f"timed out waiting for G2 page and datadome cookie ({wait_timeout}s)",
         )
     finally:
-        page.quit()
+        if not page_closed:
+            page.quit()

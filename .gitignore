@@ -1,4 +1,4 @@
-# 密钥 / 本地配置（勿提交）
+# 密钥 / 本地配置
 .env
 .env.local
 .env.*.local
@@ -16,7 +16,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 
-# Firefox 浏览器 profile（运行时生成，体积大）
+# Firefox 运行时 profile
 profiles/*
 !profiles/.gitkeep
 

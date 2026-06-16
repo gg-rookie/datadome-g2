@@ -1,4 +1,4 @@
-"""固定大小的 Firefox 进程池，同步取 datadome cookie。"""
+"""Fixed-size Firefox process pool for acquiring DataDome cookies."""
 from __future__ import annotations
 
 import logging
@@ -8,14 +8,29 @@ from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeo
 from pathlib import Path
 
 from config import settings
-from services.browser import BrowserLaunchConfig, G2PageError, fetch_g2_session, proxy_url_for_worker
+from services.browser import (
+    BrowserLaunchConfig,
+    G2PageError,
+    fetch_g2_session,
+    proxy_url_for_worker,
+)
 
 logger = logging.getLogger("datadome.pool")
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def _worker_fetch(args: tuple) -> dict:
-    worker_id, url, timeout, base_port, profiles_root, firefox_path, headless, proxy_url = args
+    (
+        worker_id,
+        url,
+        timeout,
+        base_port,
+        profiles_root,
+        firefox_path,
+        headless,
+        proxy_url,
+        use_profile_cache,
+    ) = args
     sys.path.insert(0, str(ROOT))
 
     cfg = BrowserLaunchConfig(
@@ -38,6 +53,7 @@ def _worker_fetch(args: tuple) -> dict:
             user_dir=user_dir,
             proxy_url=proxy or None,
             port=port,
+            use_profile_cache=use_profile_cache,
         )
         session["worker_id"] = worker_id
         session["ok"] = True
@@ -73,14 +89,18 @@ class BrowserPool:
         if self._executor:
             return
         self._executor = ProcessPoolExecutor(max_workers=self.pool_size)
-        logger.info("browser pool started size=%d headless=%s", self.pool_size, settings.headless)
+        logger.info(
+            "browser pool started size=%d headless=%s",
+            self.pool_size,
+            settings.headless,
+        )
 
     def stop(self) -> None:
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
 
-    def fetch(self, url: str | None = None) -> dict:
+    def fetch(self, url: str | None = None, *, use_profile_cache: bool = True) -> dict:
         if not self._executor:
             raise RuntimeError("browser pool not started")
         slot = self._next_slot()
@@ -94,6 +114,7 @@ class BrowserPool:
             settings.firefox_path,
             settings.headless,
             settings.proxy_url,
+            use_profile_cache,
         )
         fut = self._executor.submit(_worker_fetch, args)
         try:
@@ -104,7 +125,7 @@ class BrowserPool:
                 "ok": False,
                 "worker_id": slot,
                 "state": "timeout",
-                "error": f"浏览器任务超时（>{settings.cookie_timeout}s）",
+                "error": f"browser task timed out (>{settings.cookie_timeout}s)",
             }
 
     def _next_slot(self) -> int:

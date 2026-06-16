@@ -1,52 +1,31 @@
-"""验证 Redis datadome:g2:ck:pool 里每条 cookie 对 G2 是否有效。"""
+"""Validate every cookie payload in the Redis pool against TARGET_URL."""
 from __future__ import annotations
 
 import json
 import sys
-import time
 from pathlib import Path
-
-from curl_cffi import requests as cffi_requests
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from services.cookie_store import pool_key, redis_client
-
-G2_URL = "https://www.g2.com/search/products?query=slack&order=popular"
+from services.cookie_validator import validate_cookie
 
 
 def probe(item: dict, index: int) -> dict:
-    wid = item.get("worker_id", "?")
-    prefix = (item.get("cookie") or "")[:36]
-    updated = item.get("updated_at", "?")
-    headers = {
-        "Cookie": item["cookie"],
-        "User-Agent": item.get("user_agent", ""),
+    result = validate_cookie(item)
+    return {
+        "index": index,
+        "worker_id": item.get("worker_id", "?"),
+        "updated_at": item.get("updated_at", "?"),
+        "ok": result.get("ok", False),
+        "status": result.get("status"),
+        "bytes": result.get("bytes", 0),
+        "elapsed": result.get("elapsed"),
+        "url": result.get("url"),
+        "error": result.get("error"),
+        "cookie_prefix": (item.get("cookie") or "")[:36],
     }
-    t0 = time.monotonic()
-    try:
-        r = cffi_requests.get(G2_URL, headers=headers, timeout=30, impersonate="chrome")
-        ok = r.status_code == 200 and len(r.text) > 20_000
-        return {
-            "index": index,
-            "worker_id": wid,
-            "updated_at": updated,
-            "ok": ok,
-            "status": r.status_code,
-            "bytes": len(r.text),
-            "elapsed": round(time.monotonic() - t0, 2),
-            "cookie_prefix": prefix,
-        }
-    except Exception as e:
-        return {
-            "index": index,
-            "worker_id": wid,
-            "updated_at": updated,
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-            "cookie_prefix": prefix,
-        }
 
 
 def main() -> None:
@@ -54,7 +33,7 @@ def main() -> None:
     pool = [json.loads(x) for x in raw]
     print(f"pool key={pool_key()} count={len(pool)}", flush=True)
     if not pool:
-        print("pool 为空", file=sys.stderr)
+        print("pool is empty", file=sys.stderr)
         sys.exit(1)
 
     results = []
@@ -81,8 +60,8 @@ def main() -> None:
     }
     out = ROOT / "test_pool_validity_results.json"
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n=== {ok_n}/{len(pool)} 有效 ({rate}%) ===", flush=True)
-    print(f"详情: {out}", flush=True)
+    print(f"\n=== {ok_n}/{len(pool)} valid ({rate}%) ===", flush=True)
+    print(f"details: {out}", flush=True)
     sys.exit(0 if ok_n == len(pool) else 1)
 
 

@@ -1,23 +1,10 @@
-"""DataDome Cookie 单机服务：Flask + Firefox 同进程部署（生产机直接启动）。"""
+"""Redis-driven DataDome cookie refill worker."""
 from __future__ import annotations
 
 import logging
 
-from flask import Flask
-
-from api.routes import register_routes
 from config import settings
-from services.browser_pool import browser_pool
-
-
-def create_app() -> Flask:
-    app = Flask(__name__)
-    register_routes(app)
-    browser_pool.start()
-    return app
-
-
-app = create_app()
+from services.refill_worker import run_refill_loop
 
 
 if __name__ == "__main__":
@@ -26,17 +13,13 @@ if __name__ == "__main__":
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     logging.info(
-        "standalone server redis=%s:%s key=%s proxy=%s pool=%d headless=%s",
+        "worker redis=%s:%s key=%s target_pool=%d browser_pool=%d headless=%s proxy=%s",
         settings.rds_host,
         settings.rds_port,
         settings.redis_key,
-        "on" if settings.proxy_url else "off",
+        settings.target_pool_size,
         settings.browser_pool_size,
         settings.headless,
+        "on" if settings.proxy_url else "off",
     )
-    app.run(
-        host=settings.host,
-        port=settings.port,
-        debug=settings.debug,
-        threaded=True,
-    )
+    run_refill_loop()
