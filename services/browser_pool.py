@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
+import queue
 import sys
 import threading
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 from config import settings
@@ -74,21 +75,25 @@ def _worker_fetch(args: tuple) -> dict:
         }
 
 
+def _worker_entry(args: tuple, result_queue: multiprocessing.Queue) -> None:
+    result_queue.put(_worker_fetch(args))
+
+
 class BrowserPool:
     def __init__(self) -> None:
         self.pool_size = settings.browser_pool_size
-        self._executor: ProcessPoolExecutor | None = None
+        self._started = False
         self._slot = 0
         self._slot_lock = threading.Lock()
 
     @property
     def started(self) -> bool:
-        return self._executor is not None
+        return self._started
 
     def start(self) -> None:
-        if self._executor:
+        if self._started:
             return
-        self._executor = ProcessPoolExecutor(max_workers=self.pool_size)
+        self._started = True
         logger.info(
             "browser pool started size=%d headless=%s",
             self.pool_size,
@@ -96,12 +101,10 @@ class BrowserPool:
         )
 
     def stop(self) -> None:
-        if self._executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-            self._executor = None
+        self._started = False
 
     def fetch(self, url: str | None = None, *, use_profile_cache: bool = True) -> dict:
-        if not self._executor:
+        if not self._started:
             raise RuntimeError("browser pool not started")
         slot = self._next_slot()
         target = url or settings.target_url
@@ -116,16 +119,32 @@ class BrowserPool:
             settings.proxy_url,
             use_profile_cache,
         )
-        fut = self._executor.submit(_worker_fetch, args)
-        try:
-            return fut.result(timeout=settings.cookie_timeout + 60)
-        except FuturesTimeoutError:
-            fut.cancel()
+        timeout = settings.cookie_timeout + 60
+        ctx = multiprocessing.get_context("spawn")
+        result_queue = ctx.Queue(maxsize=1)
+        proc = ctx.Process(target=_worker_entry, args=(args, result_queue))
+        proc.start()
+        proc.join(timeout=timeout)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
             return {
                 "ok": False,
                 "worker_id": slot,
                 "state": "timeout",
                 "error": f"browser task timed out (>{settings.cookie_timeout}s)",
+            }
+        try:
+            return result_queue.get_nowait()
+        except queue.Empty:
+            return {
+                "ok": False,
+                "worker_id": slot,
+                "state": "worker_exited",
+                "error": f"browser worker exited with code {proc.exitcode}",
             }
 
     def _next_slot(self) -> int:

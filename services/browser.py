@@ -38,6 +38,7 @@ _CAPTCHA_IFRAME_SELECTORS = (
 )
 
 _G2_COOKIE_NAMES = ("__cf_bm", "cf_clearance", "datadome")
+_REPLAY_REQUIRED_COOKIE_NAMES = ("datadome",)
 
 
 @dataclass
@@ -181,11 +182,19 @@ def _header_value(headers, name: str) -> str:
 
 
 def _cookie_header_complete(cookie_header: str) -> bool:
-    return all(f"{name}=" in (cookie_header or "") for name in ("cf_clearance", "datadome"))
+    return all(f"{name}=" in (cookie_header or "") for name in _REPLAY_REQUIRED_COOKIE_NAMES)
+
+
+def _missing_cookie_names(cookie_header: str) -> list[str]:
+    return [
+        name
+        for name in _REPLAY_REQUIRED_COOKIE_NAMES
+        if f"{name}=" not in (cookie_header or "")
+    ]
 
 
 def _install_cookie_header_capture(page) -> dict[str, str]:
-    captured = {"cookie": "", "url": ""}
+    captured = {"cookie": "", "url": "", "last_cookie": "", "last_url": ""}
     driver = page._driver._browser_driver
     context_id = page._context_id
 
@@ -195,6 +204,9 @@ def _install_cookie_header_capture(page) -> dict[str, str]:
         if "g2.com/products/" not in url and "www.g2.com" not in url:
             return
         cookie_header = _header_value(request.get("headers"), "cookie")
+        if cookie_header:
+            captured["last_cookie"] = cookie_header
+            captured["last_url"] = url
         if _cookie_header_complete(cookie_header):
             captured["cookie"] = cookie_header
             captured["url"] = url
@@ -273,15 +285,22 @@ def _extract_cookie_values_sqlite(profile_dir: Path, names: tuple[str, ...]) -> 
 
 def _build_g2_cookie_header(page, profile_dir: Path) -> str:
     values = _extract_cookie_values_bidi(page, _G2_COOKIE_NAMES)
-    if "datadome" not in values or "cf_clearance" not in values:
+    if "datadome" not in values:
         values = _extract_cookie_values_sqlite(profile_dir, _G2_COOKIE_NAMES)
-    if "datadome" not in values or "cf_clearance" not in values:
+    if "datadome" not in values:
         return ""
     return "; ".join(
         f"{name}={values[name]}"
         for name in _G2_COOKIE_NAMES
         if values.get(name)
     )
+
+
+def _cookie_values_for_log(page, profile_dir: Path) -> dict[str, str]:
+    values = _extract_cookie_values_bidi(page, _G2_COOKIE_NAMES)
+    if len(values) < len(_G2_COOKIE_NAMES):
+        values = {**_extract_cookie_values_sqlite(profile_dir, _G2_COOKIE_NAMES), **values}
+    return values
 
 
 def _profile_user_agent(profile_dir: Path) -> str:
@@ -298,7 +317,7 @@ def _profile_user_agent(profile_dir: Path) -> str:
 
 def _profile_cookie_session(profile_dir: Path, cur_url: str = "") -> dict[str, str] | None:
     values = _extract_cookie_values_sqlite(profile_dir, _G2_COOKIE_NAMES)
-    if not values.get("datadome") or not values.get("cf_clearance"):
+    if not values.get("datadome"):
         return None
     cookie_header = "; ".join(
         f"{name}={values[name]}"
@@ -690,6 +709,9 @@ def fetch_g2_session(
         page.wait.doc_loaded(timeout=_remaining(10))
 
         slider_attempts = 0
+        ready_since = 0.0
+        ready_reload_done = False
+        last_ready_diag_at = 0.0
         while time.time() < session_deadline:
             state, cur_url, cur_title = _page_state(page)
 
@@ -744,6 +766,9 @@ def fetch_g2_session(
                 )
 
             if state == "ready":
+                now = time.time()
+                if not ready_since:
+                    ready_since = now
                 session = _try_finish_session(
                     page,
                     profile_dir,
@@ -757,6 +782,37 @@ def fetch_g2_session(
                         headless_on, slider_attempts, cur_url[:80],
                     )
                     return session
+
+                if now - last_ready_diag_at >= 10:
+                    values = _cookie_values_for_log(page, profile_dir)
+                    logger.info(
+                        "page ready but cookie incomplete missing_header=%s stored=%s last_url=%s",
+                        ",".join(_missing_cookie_names(captured_cookie.get("last_cookie", ""))),
+                        ",".join(sorted(values.keys())) or "-",
+                        (captured_cookie.get("last_url") or cur_url)[:80],
+                    )
+                    last_ready_diag_at = now
+
+                if not ready_reload_done and now - ready_since >= 5 and _remaining(10) > 10:
+                    ready_reload_done = True
+                    logger.info("page ready; reload once to emit full browser cookie header")
+                    page.get(target, wait="interactive", timeout=_remaining(10))
+                    page.wait.doc_loaded(timeout=_remaining(10))
+                    continue
+
+                if now - ready_since >= 35:
+                    missing = _missing_cookie_names(captured_cookie.get("last_cookie", ""))
+                    values = _cookie_values_for_log(page, profile_dir)
+                    raise G2PageError(
+                        "cookie_incomplete",
+                        cur_url,
+                        cur_title,
+                        "page ready but replay cookie incomplete; "
+                        f"missing_header={','.join(missing) or '-'} "
+                        f"stored={','.join(sorted(values.keys())) or '-'}",
+                    )
+            else:
+                ready_since = 0.0
 
             time.sleep(_POLL_INTERVAL_SEC)
 
@@ -782,7 +838,7 @@ def fetch_g2_session(
             }
 
         values = _extract_cookie_values_sqlite(profile_dir, _G2_COOKIE_NAMES)
-        if values.get("datadome") and values.get("cf_clearance"):
+        if values.get("datadome"):
             cookie_header = "; ".join(
                 f"{name}={values[name]}"
                 for name in _G2_COOKIE_NAMES

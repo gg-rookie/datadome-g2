@@ -13,6 +13,9 @@ def validate_cookie(result: dict, url: str | None = None) -> dict:
     headers = {
         "Cookie": result.get("cookie", ""),
         "User-Agent": result.get("user_agent", ""),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
     }
     t0 = time.monotonic()
     try:
@@ -20,7 +23,7 @@ def validate_cookie(result: dict, url: str | None = None) -> dict:
             target,
             headers=headers,
             timeout=30,
-            impersonate="chrome",
+            impersonate=settings.cookie_validation_impersonate,
         )
         body_len = len(r.text or "")
         ok_ = r.status_code == 200 and body_len > 20_000

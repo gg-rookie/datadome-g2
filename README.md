@@ -48,6 +48,7 @@ worker 会轮询 Redis。当 `LLEN REDIS_KEY:pool` 小于 `TARGET_POOL_SIZE` 时
 - `REDIS_POLL_INTERVAL`：池已满时的轮询间隔。
 - `REFILL_SUCCESS_INTERVAL`：成功生产一条 cookie 后的等待时间。
 - `REFILL_FAILURE_INTERVAL`：生产失败后的等待时间。
+- `COOKIE_VALIDATION_IMPERSONATE`：cookie 入池前的重放验证指纹。因为 cookie 由 Firefox 生成，默认使用 `firefox`。
 - `FIREFOX_PATH`：ruyipage Firefox 路径。
 - `PROFILES_DIR`：Firefox profile 目录。
 - `BROWSER_POOL_SIZE`：浏览器 worker 进程数。G2 场景建议保持较低，默认 `1`。
@@ -66,4 +67,4 @@ worker 会轮询 Redis。当 `LLEN REDIS_KEY:pool` 小于 `TARGET_POOL_SIZE` 时
 
 - 不要提交 `.env`。
 - `profiles/`、`*.log`、`test_*_results.json` 都是运行时产物，不应提交。
-- 当前 cookie 提取方式优先使用 Firefox 真实网络请求里的完整 `Cookie` header；不要只从 `cookies.sqlite` 拼接 cookie，否则容易出现浏览器页面正常但重放 403 的情况。
+- 当前 cookie 提取方式优先使用 Firefox 真实网络请求里的完整 `Cookie` header，并且至少要求包含 `datadome` 后才入池；`__cf_bm`、`cf_clearance` 如果存在会一并带上，但不作为必要条件。不要只从 `cookies.sqlite` 拼接 cookie，否则容易出现浏览器页面正常但重放 403 的情况。

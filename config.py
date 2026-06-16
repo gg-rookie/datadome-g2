@@ -55,6 +55,9 @@ class Settings:
     redis_poll_interval: float = float(_env.get("REDIS_POLL_INTERVAL", "10"))
     refill_success_interval: float = float(_env.get("REFILL_SUCCESS_INTERVAL", "1"))
     refill_failure_interval: float = float(_env.get("REFILL_FAILURE_INTERVAL", "15"))
+    cookie_validation_impersonate: str = _env.get(
+        "COOKIE_VALIDATION_IMPERSONATE", "firefox"
+    )
 
     rds_host: str = _env.get("RDS_HOST", "127.0.0.1")
     rds_port: int = int(_env.get("RDS_PORT", "6379"))
